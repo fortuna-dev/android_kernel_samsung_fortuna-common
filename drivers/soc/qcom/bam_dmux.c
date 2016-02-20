@@ -48,6 +48,10 @@
 #define MAX_POLLING_SLEEP (6050)
 #define MIN_POLLING_SLEEP (950)
 
+#ifdef BAM_DMUX_FD
+static unsigned int wakelock_timeout;
+#endif
+
 static int msm_bam_dmux_debug_enable;
 module_param_named(debug_enable, msm_bam_dmux_debug_enable,
 		   int, S_IRUGO | S_IWUSR | S_IWGRP);
@@ -528,8 +532,6 @@ static void bam_mux_process_data(struct sk_buff *rx_skb)
 	struct bam_mux_hdr *rx_hdr;
 	unsigned long event_data;
 	uint8_t ch_id;
-	void (*notify)(void *, int, unsigned long);
-	void *priv;
 
 	rx_hdr = (struct bam_mux_hdr *)rx_skb->data;
 	ch_id = rx_hdr->ch_id;
@@ -542,19 +544,15 @@ static void bam_mux_process_data(struct sk_buff *rx_skb)
 	rx_skb->truesize = rx_hdr->pkt_len + sizeof(struct sk_buff);
 
 	event_data = (unsigned long)(rx_skb);
-	notify = NULL;
-	priv = NULL;
 
 	spin_lock_irqsave(&bam_ch[ch_id].lock, flags);
-	if (bam_ch[ch_id].notify) {
-		notify = bam_ch[ch_id].notify;
-		priv = bam_ch[ch_id].priv;
-	}
-	spin_unlock_irqrestore(&bam_ch[ch_id].lock, flags);
-	if (notify)
-		notify(priv, BAM_DMUX_RECEIVE, event_data);
+	if (bam_ch[ch_id].notify)
+		bam_ch[ch_id].notify(
+			bam_ch[ch_id].priv, BAM_DMUX_RECEIVE,
+							event_data);
 	else
 		dev_kfree_skb_any(rx_skb);
+	spin_unlock_irqrestore(&bam_ch[ch_id].lock, flags);
 
 	queue_rx();
 }
@@ -2160,8 +2158,12 @@ static void release_wakelock(void)
 	BAM_DMUX_LOG("%s: ref count = %d\n", __func__,
 						wakelock_reference_count);
 	--wakelock_reference_count;
-	if (wakelock_reference_count == 0)
+	if (wakelock_reference_count == 0) {
 		wake_unlock(&bam_wakelock);
+#ifdef BAM_DMUX_FD
+		wake_lock_timeout(&bam_wakelock, wakelock_timeout * HZ);
+#endif
+	}
 	spin_unlock_irqrestore(&wakelock_reference_lock, flags);
 }
 
@@ -2803,6 +2805,38 @@ static struct platform_driver bam_dmux_driver = {
 	},
 };
 
+#ifdef BAM_DMUX_FD
+struct device *bamDmux_pkt_dev;
+
+static ssize_t show_waketime(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	if (!bamDmux_pkt_dev)
+		return 0;
+
+	return snprintf(buf, PAGE_SIZE, "%u\n", wakelock_timeout);
+}
+
+static ssize_t store_waketime(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	int r;
+	unsigned long msec;
+	if (!bamDmux_pkt_dev)
+		return count;
+
+	r = kstrtoul(buf, 10, &msec);
+
+	if (r)
+		return count;
+
+	wakelock_timeout = (msec/1000);
+	return count;
+}
+
+static DEVICE_ATTR(waketime, 0664, show_waketime, store_waketime);
+#endif
+
 static int __init bam_dmux_init(void)
 {
 #ifdef CONFIG_DEBUG_FS
@@ -2814,6 +2848,18 @@ static int __init bam_dmux_init(void)
 		debug_create("ul_pkt_cnt", 0444, dent, debug_ul_pkt_cnt);
 		debug_create("stats", 0444, dent, debug_stats);
 	}
+#endif
+
+#ifdef BAM_DMUX_FD
+	wakelock_timeout = 0;
+	bamDmux_pkt_dev = device_create(sec_class, NULL, 0, NULL, "bamdmux");
+	if (IS_ERR(bamDmux_pkt_dev))
+		pr_err("%s: Failed to create device(bamDmux_pkt_dev)!\n",
+			__func__);
+
+	if (device_create_file(bamDmux_pkt_dev, &dev_attr_waketime) < 0)
+		pr_err("%s: Failed to create device file(%s)!\n",
+			__func__, dev_attr_waketime.attr.name);
 #endif
 
 	bam_ipc_log_txt = ipc_log_context_create(BAM_IPC_LOG_PAGES, "bam_dmux",
